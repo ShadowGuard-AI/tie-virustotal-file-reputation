@@ -27,7 +27,9 @@ def setup_argparse():
     )
     parser.add_argument(
         "hash",
-        help="The file hash (MD5, SHA1, or SHA256) to check against VirusTotal.",
+        nargs="?",
+        default=None,
+        help="The file hash (MD5, SHA1, or SHA256) to check against VirusTotal. Omit when -f/--file is given.",
     )
     parser.add_argument(
         "-k",
@@ -38,6 +40,12 @@ def setup_argparse():
         "-f",
         "--file",
         help="Instead of providing the hash directly, provide a file path to hash and submit to VirusTotal.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Timeout in seconds for the VirusTotal request (default: 30).",
     )
     parser.add_argument(
         "-w",
@@ -74,46 +82,47 @@ def calculate_hash(file_path, hash_type="sha256"):
         return None
 
 
-def check_file_reputation(file_hash, api_key, wait_time=15):
+def check_file_reputation(file_hash, api_key, wait_time=15, timeout=30, max_retries=3):
     """
     Checks the reputation of a file hash against the VirusTotal API.
 
-    Args:
-        file_hash (str): The file hash (MD5, SHA1, or SHA256).
-        api_key (str): Your VirusTotal API key.
-        wait_time (int): Wait time in seconds before retrying after exceeding rate limits.
-
     Returns:
-        dict: A dictionary containing the VirusTotal API response, or None on error.
+        tuple: (outcome, data) where outcome is one of "success",
+        "not_found", "rate_limited", or "error". Data is the parsed
+        response on success, otherwise None.
     """
     url = "https://www.virustotal.com/api/v3/files/" + file_hash
     headers = {"x-apikey": api_key}
 
-    try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request error: {e}")
+            return "error", None
 
         if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 204:
-            logging.warning("Rate limit exceeded. Waiting and retrying...")
-            time.sleep(wait_time)
-            return check_file_reputation(file_hash, api_key, wait_time)  # Retry
+            try:
+                return "success", response.json()
+            except ValueError as e:
+                logging.error(f"Error decoding VirusTotal response: {e}")
+                return "error", None
         elif response.status_code == 404:
             logging.info(f"File with hash {file_hash} not found on VirusTotal.")
-            return None
-        else:
-            logging.error(
-                f"Error: HTTP {response.status_code} - {response.text}"
+            return "not_found", None
+        elif response.status_code in (204, 429):
+            logging.warning(
+                f"Rate limit response (HTTP {response.status_code}) on attempt {attempt} of {max_retries}."
             )
-            return None
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request error: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-        return None
+            if attempt < max_retries:
+                time.sleep(wait_time)
+                continue
+            logging.error("Rate limit persisted after all retries.")
+            return "rate_limited", None
+        else:
+            logging.error(f"Error: HTTP {response.status_code}")
+            return "error", None
+    return "rate_limited", None
 
 
 def main():
@@ -132,6 +141,11 @@ def main():
         )
         sys.exit(1)
 
+    if args.file and args.hash:
+        parser.error("Provide either a hash or -f/--file, not both.")
+    if not args.file and not args.hash:
+        parser.error("Provide a file hash, or use -f/--file to hash a local file.")
+
     file_hash = args.hash
     if args.file:
         file_hash = calculate_hash(args.file, "sha256")
@@ -142,34 +156,47 @@ def main():
         logging.error("File hash not provided.")
         sys.exit(1)
 
-    # Validate the input hash
-    if not (
-        len(file_hash) == 32
-        or len(file_hash) == 40
-        or len(file_hash) == 64
+    # Validate the input hash: correct length and hexadecimal only.
+    if len(file_hash) not in (32, 40, 64) or any(
+        c not in "0123456789abcdefABCDEF" for c in file_hash
     ):
         logging.error(
-            "Invalid hash format.  Please provide an MD5 (32 characters), SHA1 (40 characters), or SHA256 (64 characters) hash."
+            "Invalid hash format.  Please provide a hexadecimal MD5 (32 characters), SHA1 (40 characters), or SHA256 (64 characters) hash."
         )
         sys.exit(1)
 
     # Check the file reputation
-    result = check_file_reputation(file_hash, api_key, args.wait_time)
+    outcome, result = check_file_reputation(
+        file_hash, api_key, args.wait_time, timeout=args.timeout
+    )
 
-    if result:
-        if "data" in result and "attributes" in result["data"]:
-            stats = result["data"]["attributes"]["last_analysis_stats"]
-            print(f"File Hash: {file_hash}")
-            print(f"Detections: {stats['malicious']}")
-            print(f"Harmless: {stats['harmless']}")
-            print(f"Suspicious: {stats['suspicious']}")
-            print(f"Undetected: {stats['undetected']}")
-        else:
-            logging.warning(f"No scan results available for hash {file_hash}")
-
-    else:
+    if outcome == "not_found":
+        print(f"File with hash {file_hash} not found on VirusTotal.")
+        return
+    if outcome == "rate_limited":
+        logging.error(
+            "VirusTotal rate limit persisted after bounded retries; no reputation result was retrieved."
+        )
+        sys.exit(1)
+    if outcome != "success" or not result:
         logging.error("Failed to retrieve file reputation from VirusTotal.")
         sys.exit(1)
+
+    data = result.get("data") if isinstance(result, dict) else None
+    attributes = data.get("attributes") if isinstance(data, dict) else None
+    stats = attributes.get("last_analysis_stats") if isinstance(attributes, dict) else None
+    if not isinstance(stats, dict) or not all(
+        key in stats for key in ("malicious", "harmless", "suspicious", "undetected")
+    ):
+        logging.error(
+            f"Malformed VirusTotal response for hash {file_hash}: no usable last_analysis_stats. Run failed."
+        )
+        sys.exit(1)
+    print(f"File Hash: {file_hash}")
+    print(f"Detections: {stats['malicious']}")
+    print(f"Harmless: {stats['harmless']}")
+    print(f"Suspicious: {stats['suspicious']}")
+    print(f"Undetected: {stats['undetected']}")
 
 
 if __name__ == "__main__":
