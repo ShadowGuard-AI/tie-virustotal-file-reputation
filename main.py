@@ -61,6 +61,8 @@ def calculate_hash(file_path, hash_type="sha256"):
     """Calculates the hash of a file."""
     try:
         with open(file_path, "rb") as f:
+            # The whole file is read into memory before hashing. That suits the small samples this
+            # was built for and is the wrong shape for a disk image or a large archive.
             file_content = f.read()
 
         if hash_type == "md5":
@@ -82,6 +84,8 @@ def calculate_hash(file_path, hash_type="sha256"):
         return None
 
 
+# max_retries has no command line switch. Whatever a caller asks for on the command
+# line, this default of three attempts is what they get.
 def check_file_reputation(file_hash, api_key, wait_time=15, timeout=30, max_retries=3):
     """
     Checks the reputation of a file hash against the VirusTotal API.
@@ -97,6 +101,8 @@ def check_file_reputation(file_hash, api_key, wait_time=15, timeout=30, max_retr
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.get(url, headers=headers, timeout=timeout)
+        # A network failure ends the call on the first attempt. Only rate limit answers earn a
+        # retry below, so a single timing hiccup counts as a final error here.
         except requests.exceptions.RequestException as e:
             logging.error(f"Request error: {e}")
             return "error", None
@@ -115,6 +121,8 @@ def check_file_reputation(file_hash, api_key, wait_time=15, timeout=30, max_retr
                 f"Rate limit response (HTTP {response.status_code}) on attempt {attempt} of {max_retries}."
             )
             if attempt < max_retries:
+                # The wait is the fixed number I was given. I never read a Retry-After header, so I can
+                # come back sooner than the service asked, or sit out longer than it needed.
                 time.sleep(wait_time)
                 continue
             logging.error("Rate limit persisted after all retries.")
@@ -171,6 +179,8 @@ def main():
     )
 
     if outcome == "not_found":
+        # Not found ends at exit 0, the same as a successful lookup. Only the printed line separates
+        # an unknown hash from a known and answered one, so a wrapping script has to read it.
         print(f"File with hash {file_hash} not found on VirusTotal.")
         return
     if outcome == "rate_limited":
@@ -193,6 +203,8 @@ def main():
         )
         sys.exit(1)
     print(f"File Hash: {file_hash}")
+    # Four counters are all I print. The timeout and type unsupported buckets in the same stats
+    # block never appear, so these numbers do not add up to the engine total on their own.
     print(f"Detections: {stats['malicious']}")
     print(f"Harmless: {stats['harmless']}")
     print(f"Suspicious: {stats['suspicious']}")
