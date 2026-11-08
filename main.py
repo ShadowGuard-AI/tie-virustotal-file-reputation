@@ -59,22 +59,23 @@ def setup_argparse():
 
 def calculate_hash(file_path, hash_type="sha256"):
     """Calculates the hash of a file."""
+    if hash_type == "md5":
+        hasher = hashlib.md5()
+    elif hash_type == "sha1":
+        hasher = hashlib.sha1()
+    elif hash_type == "sha256":
+        hasher = hashlib.sha256()
+    else:
+        logging.error(f"Unsupported hash type: {hash_type}")
+        return None
+
     try:
+        # Stream the file in chunks so a large file is hashed without
+        # loading it whole into memory.
         with open(file_path, "rb") as f:
-            # The whole file is read into memory before hashing. That suits the small samples this
-            # was built for and is the wrong shape for a disk image or a large archive.
-            file_content = f.read()
-
-        if hash_type == "md5":
-            file_hash = hashlib.md5(file_content).hexdigest()
-        elif hash_type == "sha1":
-            file_hash = hashlib.sha1(file_content).hexdigest()
-        elif hash_type == "sha256":
-            file_hash = hashlib.sha256(file_content).hexdigest()
-        else:
-            raise ValueError(f"Unsupported hash type: {hash_type}")
-
-        return file_hash
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     except FileNotFoundError:
         logging.error(f"File not found: {file_path}")
@@ -121,9 +122,17 @@ def check_file_reputation(file_hash, api_key, wait_time=15, timeout=30, max_retr
                 f"Rate limit response (HTTP {response.status_code}) on attempt {attempt} of {max_retries}."
             )
             if attempt < max_retries:
-                # The wait is the fixed number I was given. I never read a Retry-After header, so I can
-                # come back sooner than the service asked, or sit out longer than it needed.
-                time.sleep(wait_time)
+                # Respect a Retry-After header from the service when one is
+                # present and parses as a non-negative number of seconds;
+                # otherwise fall back to the configured wait time.
+                retry_after = response.headers.get("Retry-After") if getattr(response, "headers", None) else None
+                try:
+                    delay = float(retry_after)
+                    if delay < 0:
+                        delay = wait_time
+                except (TypeError, ValueError):
+                    delay = wait_time
+                time.sleep(delay)
                 continue
             logging.error("Rate limit persisted after all retries.")
             return "rate_limited", None
